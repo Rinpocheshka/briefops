@@ -1,4 +1,4 @@
-"""BriefOps: durable business lead automation. Python 3.11+, standard library only."""
+"""BriefOps: durable inquiry processing, human review and Postgres storage."""
 from __future__ import annotations
 
 import argparse
