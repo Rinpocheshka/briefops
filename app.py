@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from llm import complete_json, load_local_settings, settings as llm_settings
 from database import Database
 from access import WorkspaceAccess
@@ -226,6 +226,12 @@ class Store:
                     status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                     run_after REAL NOT NULL, last_error TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL, updated_at REAL NOT NULL, sent_at REAL);
+                CREATE TABLE IF NOT EXISTS website_notifications(
+                    id TEXT PRIMARY KEY, lead_id TEXT UNIQUE NOT NULL REFERENCES leads(id),
+                    contact TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
+                    status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                    run_after REAL NOT NULL, last_error TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL, sent_at REAL);
             """, direct_url)
         with self.db() as db:
             stale = db.execute("SELECT lead_id FROM jobs WHERE state='running' AND run_after<=?", (time.time(),)).fetchall()
@@ -285,6 +291,12 @@ class Store:
             db.execute("INSERT INTO jobs(lead_id,state,run_after) VALUES(?,?,?)", (lead_id, "pending", time.time()))
             if self.workspace:
                 db.execute("INSERT INTO lead_context VALUES(?,?,?,?)", (lead_id, contact, site_url, form_id))
+                owner = os.getenv("BRIEFOPS_OWNER_EMAIL", "")
+                if form_id == "wov-v1" and is_email(owner):
+                    subject = "Новая заявка World of Vibecraft · " + lead_id
+                    body = f"Новая заявка с сайта World of Vibecraft\n\nИмя: {name}\nКонтакт: {contact}\n\n{text}\n\nПроверить и ответить: https://briefops.onrender.com/workspace\nЗаявка: {lead_id}"
+                    db.execute("INSERT INTO website_notifications(id,lead_id,contact,subject,body,status,run_after,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                               (uuid.uuid4().hex, lead_id, owner, subject, body, "queued", time.time(), now, now))
             self.event(db, lead_id, "received", "Заявка принята", f"Источник: {source}. Сообщение сохранено до начала обработки.")
         return {"id": lead_id, "replayed": False}
 
@@ -456,22 +468,27 @@ class Store:
     def deliver_one(self):
         if not self.workspace or not self.mailer.configured:
             return False
+        return self._deliver_table_one("email_deliveries") or self._deliver_table_one("website_notifications")
+
+    def _deliver_table_one(self, table):
+        assert table in {"email_deliveries", "website_notifications"}
         now = time.time()
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM email_deliveries WHERE status IN ('queued','retry','sending') AND run_after<=? ORDER BY created_at LIMIT 1", (now,)).fetchone()
+            row = db.execute(f"SELECT * FROM {table} WHERE status IN ('queued','retry','sending') AND run_after<=? ORDER BY created_at LIMIT 1", (now,)).fetchone()
             if not row:
                 return False
             delivery = dict(row)
-            db.execute("UPDATE email_deliveries SET status='sending',attempts=attempts+1,run_after=?,updated_at=? WHERE id=?", (now + 120, now, delivery["id"]))
+            db.execute(f"UPDATE {table} SET status='sending',attempts=attempts+1,run_after=?,updated_at=? WHERE id=?", (now + 120, now, delivery["id"]))
         status, detail = self.mailer.send(delivery)
         if status == "retry" and delivery["attempts"] >= 2:
             status, detail = "uncertain", "Нет подтверждения от Google. Автоповтор остановлен, чтобы не отправить второе письмо."
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             now = time.time()
-            db.execute("UPDATE email_deliveries SET status=?,run_after=?,last_error=?,updated_at=?,sent_at=? WHERE id=?", (status, now + 30, "" if status == "sent" else detail, now, now if status == "sent" else None, delivery["id"]))
-            self.event(db, delivery["lead_id"], "email_" + status, "Письмо отправлено" if status == "sent" else "Статус отправки: " + status, detail)
+            db.execute(f"UPDATE {table} SET status=?,run_after=?,last_error=?,updated_at=?,sent_at=? WHERE id=?", (status, now + 30, "" if status == "sent" else detail, now, now if status == "sent" else None, delivery["id"]))
+            title = ("Уведомление владельцу отправлено" if status == "sent" else "Статус уведомления: " + status) if table == "website_notifications" else ("Письмо отправлено" if status == "sent" else "Статус отправки: " + status)
+            self.event(db, delivery["lead_id"], ("notification_" if table == "website_notifications" else "email_") + status, title, detail)
             db.execute("UPDATE leads SET updated_at=? WHERE id=?", (now, delivery["lead_id"]))
         return True
 
@@ -508,6 +525,7 @@ class Store:
             all_events = [dict(e) for e in db.execute("SELECT * FROM events ORDER BY id")]
             all_tasks = [dict(t) for t in db.execute("SELECT * FROM tasks")]
             deliveries = {r["lead_id"]: dict(r) for r in db.execute("SELECT id,lead_id,contact,subject,status,attempts,last_error,sent_at FROM email_deliveries")}
+            notifications = {r["lead_id"]: dict(r) for r in db.execute("SELECT id,lead_id,status,last_error,sent_at FROM website_notifications")}
             contexts = {r["lead_id"]: dict(r) for r in db.execute("SELECT * FROM lead_context")}
             events_by_lead, tasks_by_lead = {}, {}
             for event in all_events:
@@ -522,6 +540,7 @@ class Store:
                 lead["events"] = events_by_lead.get(lead["id"], [])
                 lead["tasks"] = tasks_by_lead.get(lead["id"], [])
                 lead["email_delivery"] = deliveries.get(lead["id"])
+                lead["email_notification"] = notifications.get(lead["id"])
                 lead["context"] = contexts.get(lead["id"], {})
                 leads.append(lead)
             deals = [dict(r) for r in db.execute("SELECT * FROM deals")]
@@ -592,6 +611,9 @@ def handler_for(demo_store, live_store=None, access=None):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
+            if self.route() == "/api/integrations/wov" and self.headers.get("Origin") == "https://rinpocheshka.github.io":
+                self.send_header("Access-Control-Allow-Origin", "https://rinpocheshka.github.io")
+                self.send_header("Vary", "Origin")
             auth_origin = urlparse(access.base_url)
             auth_connect = " " + auth_origin.scheme + "://" + auth_origin.netloc if auth_origin.netloc else ""
             self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'" + auth_connect + "; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
@@ -672,17 +694,31 @@ def handler_for(demo_store, live_store=None, access=None):
                     size = int(self.headers.get("Content-Length", "0"))
                     if not 0 < size <= 16000:
                         return self.send({"error": "Неверный размер запроса"}, 413)
+                    origin = self.headers.get("Origin")
+                    if origin and origin != "https://rinpocheshka.github.io":
+                        return self.send({"error": "Источник не разрешён"}, 403)
                     # Fail closed before saving data. No mail reading endpoints are exposed.
-                    payload = json.loads(self.rfile.read(size))
+                    raw = self.rfile.read(size)
+                    native_form = self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded")
+                    if native_form:
+                        fields = {key: values[0] for key, values in parse_qs(raw.decode("utf-8"), max_num_fields=20).items()}
+                        fields.setdefault("submission_id", uuid.uuid4().hex)
+                        payload = {"form_data": fields}
+                    else:
+                        payload = json.loads(raw)
                     data = payload.get("form_data", {}) if isinstance(payload, dict) else {}
                     if not isinstance(data, dict) or data.get("form_id") != "wov-v1" or data.get("site_url") != "https://rinpocheshka.github.io/wov/":
                         raise ValueError("Источник не разрешён")
+                    if data.get("_honey"):
+                        return self.send({"accepted": True})
                     minute = str(int(time.time() // 60))
                     remote = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()[:100]
                     ip_key = hashlib.sha256(remote.encode()).hexdigest()[:20]
                     if not live_store.allow_quota("wov-minute:" + minute, 30) or not live_store.allow_quota("wov-ip:" + ip_key, 30) or not live_store.allow_quota("wov-day", 200):
                         return self.send({"error": "Слишком много заявок. Попробуйте позже."}, 429)
                     result = live_store.intake_wov(payload)
+                    if native_form:
+                        return self.send(b"", 303, extra={"Location": "https://rinpocheshka.github.io/wov/?sent=1#cta"})
                     return self.send({"accepted": True, "replayed": result["replayed"]}, 200 if result["replayed"] else 202)
                 if private:
                     if not live_store or not access.configured or not access.authorized(self.headers.get("Authorization", "")):
@@ -741,7 +777,14 @@ def handler_for(demo_store, live_store=None, access=None):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception:
-                self.send({"error": "Не удалось выполнить действие. Заявка сохранена, попробуйте ещё раз."}, 500)
+                self.send({"error": "Не удалось выполнить действие. Попробуйте ещё раз."}, 500)
+
+        def do_OPTIONS(self):
+            if (not self.allowed_host() or self.route() != "/api/integrations/wov"
+                    or self.headers.get("Origin") != "https://rinpocheshka.github.io"
+                    or self.headers.get("Access-Control-Request-Method") != "POST"):
+                return self.send({"error": "Источник не разрешён"}, 403)
+            return self.send(b"", 204, extra={"Access-Control-Allow-Methods": "POST", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Max-Age": "600"})
 
     return Handler
 

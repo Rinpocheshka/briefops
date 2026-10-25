@@ -57,7 +57,8 @@ class LiveIntegrationTests(unittest.TestCase):
             with urllib.request.urlopen(request) as response:
                 return response.status, json.load(response)
         except urllib.error.HTTPError as error:
-            return error.code, json.load(error)
+            with error:
+                return error.code, json.load(error)
 
     def approved(self, **changes):
         lead_id=self.live.intake_wov(form(**changes))["id"]
@@ -133,6 +134,29 @@ class LiveIntegrationTests(unittest.TestCase):
         self.access.configured=False
         self.assertEqual(self.request("/api/integrations/wov",form())[0],503)
         self.assertFalse(self.live.state()["leads"])
+
+    @patch.dict(os.environ, {"BRIEFOPS_OWNER_EMAIL":"owner@example.com"})
+    def test_website_notification_is_atomic_and_goes_only_to_owner(self):
+        lead_id=self.live.intake_wov(form())["id"]
+        self.assertTrue(self.live.intake_wov(form())["replayed"])
+        self.assertTrue(self.live.deliver_one())
+        self.assertFalse(self.live.deliver_one())
+        sent=self.mailer.send.call_args.args[0]
+        self.assertEqual(sent["contact"],"owner@example.com")
+        self.assertIn("client@example.com",sent["body"])
+        self.assertEqual(self.live.get_lead(lead_id)["email_notification"]["status"],"sent")
+        self.assertIsNone(self.live.get_lead(lead_id)["email_delivery"])
+
+    def test_browser_form_cors_is_limited_to_website_origin(self):
+        def preflight(origin):
+            request=urllib.request.Request(self.url+"/api/integrations/wov",method="OPTIONS",headers={"Origin":origin,"Access-Control-Request-Method":"POST"})
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status,response.headers.get("Access-Control-Allow-Origin")
+            except urllib.error.HTTPError as error:
+                with error:return error.code,error.headers.get("Access-Control-Allow-Origin")
+        self.assertEqual(preflight("https://rinpocheshka.github.io"),(204,"https://rinpocheshka.github.io"))
+        self.assertEqual(preflight("https://other.example"),(403,None))
 
 
 class AccessTests(unittest.TestCase):

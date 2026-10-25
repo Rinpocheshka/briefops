@@ -19,7 +19,7 @@ store = Store(ROOT / "artifacts/live-neon-placeholder.sqlite3", database_url=env
 submission = "test_" + uuid.uuid4().hex
 payload = {"form_data":{"form_id":"wov-v1", "site_url":"https://rinpocheshka.github.io/wov/",
                          "submission_id":submission, "name":"Интеграционный тест",
-                         "contact":"integration@example.com", "idea":"Нужен сайт, бюджет 50 тыс. рублей."}}
+                         "contact":"integration@example.com", "idea":"Нужен сайт, бюджет 50 тыс. рублей. Проверка " + submission}}
 lead_id = store.intake_wov(payload)["id"]
 assert store.intake_wov(payload)["replayed"]
 assert store.process_one(lead_id)
