@@ -22,6 +22,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 from llm import complete_json, load_local_settings, settings as llm_settings
 from database import Database
+from access import WorkspaceAccess
+from email_delivery import MailBridge, is_email
 
 ROOT = Path(__file__).resolve().parent
 SERVICES = {
@@ -140,7 +142,8 @@ def analyze(text, name="", company="", use_llm=False):
         return result, "LLM недоступна или вернула некорректный ответ. Выполнен резервный разбор по правилам."
 
 
-def enrich_analysis(data):
+def enrich_analysis(data, services=None):
+    services = services or SERVICES
     result = dict(data)
     missing = []
     if not result.get("contact"):
@@ -150,10 +153,10 @@ def enrich_analysis(data):
     if not result.get("budget"):
         missing.append("ориентир бюджета")
     result["missing"] = missing
-    floor = SERVICES[result["service"]]["floor"]
+    floor = services[result["service"]]["floor"]
     result["below_floor"] = bool(floor and result.get("budget") and result["budget"] < floor)
     result["priority"] = "high" if result.get("urgent") else "normal"
-    result["owner"] = SERVICES[result["service"]]["owner"]
+    result["owner"] = services[result["service"]]["owner"]
     return result
 
 
@@ -173,10 +176,13 @@ def make_draft(data):
 
 
 class Store:
-    def __init__(self, path, use_llm=False, demo=True, token=None, database_url=None, direct_url=None):
+    def __init__(self, path, use_llm=False, demo=True, token=None, database_url=None, direct_url=None, workspace=False, mailer=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.use_llm, self.demo = use_llm, demo
+        self.workspace = workspace
+        self.services = {key: dict(value, owner="Илья Крючков", initials="ИК", floor=None) if workspace else dict(value) for key, value in SERVICES.items()}
+        self.mailer = mailer or MailBridge(url="", secret="")
         self.csrf = secrets.token_urlsafe(32)
         self.token = token or secrets.token_urlsafe(32)
         self.worker_lock = threading.Lock()
@@ -211,6 +217,15 @@ class Store:
                 CREATE INDEX IF NOT EXISTS ix_jobs_due ON jobs(state,run_after);
                 CREATE TABLE IF NOT EXISTS quotas(
                     name TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS lead_context(
+                    lead_id TEXT PRIMARY KEY REFERENCES leads(id), contact TEXT NOT NULL,
+                    site_url TEXT NOT NULL, form_id TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS email_deliveries(
+                    id TEXT PRIMARY KEY, lead_id TEXT UNIQUE NOT NULL REFERENCES leads(id),
+                    contact TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
+                    status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                    run_after REAL NOT NULL, last_error TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL, sent_at REAL);
             """, direct_url)
         with self.db() as db:
             stale = db.execute("SELECT lead_id FROM jobs WHERE state='running' AND run_after<=?", (time.time(),)).fetchall()
@@ -241,14 +256,20 @@ class Store:
         if not isinstance(payload, dict):
             raise ValueError("Нужен JSON-объект")
         text = clean_text(payload.get("text", ""), 10001)
-        if not 8 <= len(text) <= 10000:
+        if not (5 if self.workspace else 8) <= len(text) <= 10000:
             raise ValueError("Текст заявки должен содержать от 8 до 10 000 символов")
         source = clean_text(payload.get("source", "website"), 40)
         if source not in {"website", "telegram", "email", "manual", "n8n"}:
             raise ValueError("Неизвестный источник")
         message_id = clean_text(key or payload.get("message_id") or uuid.uuid4().hex, 128)
         name, company = clean_text(payload.get("name", ""), 80), clean_text(payload.get("company", ""), 120)
-        request_hash = hashlib.sha256(json.dumps([text, name, company], ensure_ascii=False).encode()).hexdigest()
+        contact = clean_text(payload.get("contact", ""), 254) if self.workspace else ""
+        if contact and not (is_email(contact) or TG_RE.fullmatch(contact)):
+            raise ValueError("Укажите email или Telegram-контакт")
+        site_url = clean_text(payload.get("site_url", ""), 250) if self.workspace else ""
+        form_id = clean_text(payload.get("form_id", ""), 60) if self.workspace else ""
+        hash_fields = [text, name, company] + ([contact, site_url, form_id] if self.workspace else [])
+        request_hash = hashlib.sha256(json.dumps(hash_fields, ensure_ascii=False).encode()).hexdigest()
         body_hash = hashlib.sha256(re.sub(r"\s+", " ", text.lower()).encode()).hexdigest()
         now = created_at if created_at is not None else time.time()
         with self.db() as db:
@@ -262,6 +283,8 @@ class Store:
             db.execute("""INSERT INTO leads(id,source,message_id,request_hash,body_hash,text,name,company,status,fail_once,created_at,updated_at,sla_at)
                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (lead_id, source, message_id, request_hash, body_hash, text, name, company, "queued", int(self.demo and payload.get("simulate_failure") is True), now, now, now + 20 * 60))
             db.execute("INSERT INTO jobs(lead_id,state,run_after) VALUES(?,?,?)", (lead_id, "pending", time.time()))
+            if self.workspace:
+                db.execute("INSERT INTO lead_context VALUES(?,?,?,?)", (lead_id, contact, site_url, form_id))
             self.event(db, lead_id, "received", "Заявка принята", f"Источник: {source}. Сообщение сохранено до начала обработки.")
         return {"id": lead_id, "replayed": False}
 
@@ -290,7 +313,12 @@ class Store:
                 result, warning = analyze(lead["text"], lead["name"], lead["company"], use_llm)
                 if self.use_llm and not use_llm:
                     warning = "Дневной лимит AI-разбора исчерпан. Использованы резервные правила."
-                result = enrich_analysis(result)
+                if self.workspace:
+                    with self.db() as db:
+                        context = db.execute("SELECT contact FROM lead_context WHERE lead_id=?", (lead_id,)).fetchone()
+                    if context and context["contact"]:
+                        result["contact"] = normalize_contact(context["contact"])
+                result = enrich_analysis(result, self.services)
                 if lead["fail_once"]:
                     with self.db() as db:
                         db.execute("UPDATE leads SET fail_once=0 WHERE id=?", (lead_id,))
@@ -382,7 +410,7 @@ class Store:
                     raise ValueError("Бюджет должен быть положительным целым числом до 100 млн ₽")
                 else:
                     data["budget"] = int(raw)
-            data = enrich_analysis(data)
+            data = enrich_analysis(data, self.services)
             draft = clean_text(payload.get("draft", lead["draft"]), 5000)
             if not draft:
                 raise ValueError("Черновик ответа не может быть пустым")
@@ -394,10 +422,72 @@ class Store:
             if approve:
                 db.execute("INSERT OR IGNORE INTO outbox VALUES(?,?,?,?)", (lead_id, data["contact"], draft, time.time()))
                 db.execute("UPDATE tasks SET done=1 WHERE lead_id=?", (lead_id,))
-                self.event(db, lead_id, "approved", "Ответ согласован", "Сохранён в исходящие. В демо сообщения клиентам не отправляются.")
+                self.event(db, lead_id, "approved", "Ответ согласован", "Текст сохранён. Для отправки нажмите «Отправить по email»." if self.workspace else "Сохранён в исходящие. В демо сообщения клиентам не отправляются.")
             else:
                 self.event(db, lead_id, "reviewed", "Поля проверены менеджером", "Изменения сохранены. Отправка не выполнялась.")
         return {"id": lead_id, "replayed": False}
+
+    def queue_email(self, lead_id):
+        if not self.workspace or not self.mailer.configured:
+            raise Conflict("Отправка email ещё не подключена")
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            lead = db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
+            if not lead:
+                raise Missing("Заявка не найдена")
+            if lead["status"] != "approved":
+                raise Conflict("Сначала согласуйте текст ответа")
+            contact = json.loads(lead["analysis"]).get("contact", "")
+            if not is_email(contact):
+                raise ValueError("Для отправки нужен email клиента. Telegram не подключён.")
+            old = db.execute("SELECT id,status FROM email_deliveries WHERE lead_id=?", (lead_id,)).fetchone()
+            if old:
+                # Never create another delivery, including after a timeout or concurrent click.
+                return {"id": old["id"], "status": old["status"], "replayed": True}
+            delivery_id = uuid.uuid4().hex
+            now = time.time()
+            subject = "World of Vibecraft — ответ на заявку " + lead_id
+            db.execute("INSERT INTO email_deliveries(id,lead_id,contact,subject,body,status,run_after,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (delivery_id, lead_id, contact, subject, lead["draft"], "queued", now, now, now))
+            self.event(db, lead_id, "email_queued", "Письмо поставлено в очередь", "Получатель: " + contact + ". Отправка подтверждена менеджером.")
+            db.execute("UPDATE leads SET updated_at=? WHERE id=?", (now, lead_id))
+            return {"id": delivery_id, "status": "queued", "replayed": False}
+
+    def deliver_one(self):
+        if not self.workspace or not self.mailer.configured:
+            return False
+        now = time.time()
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM email_deliveries WHERE status IN ('queued','retry','sending') AND run_after<=? ORDER BY created_at LIMIT 1", (now,)).fetchone()
+            if not row:
+                return False
+            delivery = dict(row)
+            db.execute("UPDATE email_deliveries SET status='sending',attempts=attempts+1,run_after=?,updated_at=? WHERE id=?", (now + 120, now, delivery["id"]))
+        status, detail = self.mailer.send(delivery)
+        if status == "retry" and delivery["attempts"] >= 2:
+            status, detail = "uncertain", "Нет подтверждения от Google. Автоповтор остановлен, чтобы не отправить второе письмо."
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            db.execute("UPDATE email_deliveries SET status=?,run_after=?,last_error=?,updated_at=?,sent_at=? WHERE id=?", (status, now + 30, "" if status == "sent" else detail, now, now if status == "sent" else None, delivery["id"]))
+            self.event(db, delivery["lead_id"], "email_" + status, "Письмо отправлено" if status == "sent" else "Статус отправки: " + status, detail)
+            db.execute("UPDATE leads SET updated_at=? WHERE id=?", (now, delivery["lead_id"]))
+        return True
+
+    def intake_wov(self, payload):
+        data = payload.get("form_data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or data.get("form_id") != "wov-v1" or data.get("site_url") != "https://rinpocheshka.github.io/wov/":
+            raise ValueError("Принимаются только заявки формы World of Vibecraft")
+        name = clean_text(data.get("name", ""), 81)
+        contact = clean_text(data.get("contact", ""), 255)
+        idea = clean_text(data.get("idea", ""), 2001)
+        submission_id = clean_text(data.get("submission_id", ""), 129)
+        if not 2 <= len(name) <= 80 or not 5 <= len(idea) <= 2000 or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", submission_id):
+            raise ValueError("Проверьте поля формы")
+        # Only a dedicated form endpoint is connected. No inbox or mailbox reader exists.
+        return self.intake({"text": idea, "name": name, "contact": contact, "source": "website",
+                            "site_url": data["site_url"], "form_id": "wov-v1", "message_id": submission_id})
 
     def sweep(self, now=None):
         now = now or time.time()
@@ -417,6 +507,8 @@ class Store:
             leads = []
             all_events = [dict(e) for e in db.execute("SELECT * FROM events ORDER BY id")]
             all_tasks = [dict(t) for t in db.execute("SELECT * FROM tasks")]
+            deliveries = {r["lead_id"]: dict(r) for r in db.execute("SELECT id,lead_id,contact,subject,status,attempts,last_error,sent_at FROM email_deliveries")}
+            contexts = {r["lead_id"]: dict(r) for r in db.execute("SELECT * FROM lead_context")}
             events_by_lead, tasks_by_lead = {}, {}
             for event in all_events:
                 events_by_lead.setdefault(event["lead_id"], []).append(event)
@@ -429,6 +521,8 @@ class Store:
                     lead.pop(key, None)
                 lead["events"] = events_by_lead.get(lead["id"], [])
                 lead["tasks"] = tasks_by_lead.get(lead["id"], [])
+                lead["email_delivery"] = deliveries.get(lead["id"])
+                lead["context"] = contexts.get(lead["id"], {})
                 leads.append(lead)
             deals = [dict(r) for r in db.execute("SELECT * FROM deals")]
             events = list(reversed(all_events[-150:]))
@@ -439,10 +533,12 @@ class Store:
                      "actions": sum(e["kind"] in {"parsed", "crm", "draft", "duplicate", "sla"} for e in all_events)}
             config = llm_settings()
             enabled = bool(self.use_llm and config["key"] and config["model"])
-            return {"leads": leads, "deals": deals, "events": events, "stats": stats, "services": SERVICES,
+            return {"leads": leads, "deals": deals, "events": events, "stats": stats, "services": self.services,
                     "mode": "llm" if enabled else "rules",
                     "llm": {"provider": config["provider"] if enabled else "none", "model": config["model"] if enabled else ""},
-                    "demo": self.demo, "storage": self.database.kind, "csrf": self.csrf, "now": time.time()}
+                    "demo": self.demo, "workspace": self.workspace, "email_enabled": self.workspace and self.mailer.configured,
+                    "email_sender": os.getenv("BRIEFOPS_OWNER_EMAIL", "") if self.workspace else "",
+                    "storage": self.database.kind, "csrf": self.csrf, "now": time.time()}
 
     def get_lead(self, lead_id):
         lead = next((l for l in self.state()["leads"] if l["id"] == lead_id), None)
@@ -481,7 +577,8 @@ class Missing(ValueError):
     pass
 
 
-def handler_for(store):
+def handler_for(demo_store, live_store=None, access=None):
+    access = access or WorkspaceAccess()
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -495,7 +592,9 @@ def handler_for(store):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+            auth_origin = urlparse(access.base_url)
+            auth_connect = " " + auth_origin.scheme + "://" + auth_origin.netloc if auth_origin.netloc else ""
+            self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'" + auth_connect + "; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
             for key, value in (extra or {}).items():
                 self.send_header(key, value)
             self.end_headers()
@@ -516,7 +615,17 @@ def handler_for(store):
             if not self.allowed_host():
                 return self.send({"error": "Host не разрешён"}, 403)
             route = self.route()
+            private = route.startswith("/api/workspace/")
+            store = live_store if private else demo_store
             try:
+                if route == "/api/auth-config":
+                    return self.send({"base_url": access.base_url, "enabled": bool(live_store and access.configured)})
+                if private:
+                    if not live_store or not access.configured:
+                        return self.send({"error": "Рабочий кабинет ещё не подключён"}, 503)
+                    if not access.authorized(self.headers.get("Authorization", "")):
+                        return self.send({"error": "Войдите в рабочий кабинет"}, 401)
+                    route = route.replace("/api/workspace/", "/api/", 1)
                 if route == "/api/state":
                     return self.send(store.state())
                 if route == "/api/health":
@@ -536,7 +645,7 @@ def handler_for(store):
                         # Prevent spreadsheet formula injection when opened in Excel.
                         writer.writerow(["'" + str(v) if str(v).startswith(("=", "+", "-", "@", "\t", "\r")) else v for v in values])
                     return self.send(("\ufeff" + output.getvalue()).encode(), content_type="text/csv; charset=utf-8", extra={"Content-Disposition": 'attachment; filename="briefops-leads.csv"'})
-                files = {"/": ("static/index.html", "text/html; charset=utf-8"), "/app.js": ("static/app.js", "text/javascript; charset=utf-8"), "/styles.css": ("static/styles.css", "text/css; charset=utf-8"), "/workflow.json": ("workflows/intake.json", "application/json"), "/sla-workflow.json": ("workflows/sla.json", "application/json")}
+                files = {"/": ("static/index.html", "text/html; charset=utf-8"), "/workspace": ("static/index.html", "text/html; charset=utf-8"), "/login": ("static/login.html", "text/html; charset=utf-8"), "/auth.js": ("static/auth.js", "text/javascript; charset=utf-8"), "/app.js": ("static/app.js", "text/javascript; charset=utf-8"), "/styles.css": ("static/styles.css", "text/css; charset=utf-8"), "/workflow.json": ("workflows/intake.json", "application/json"), "/sla-workflow.json": ("workflows/sla.json", "application/json")}
                 if route in files:
                     name, mime = files[route]
                     if route in {"/workflow.json", "/sla-workflow.json"} and os.getenv("RENDER_EXTERNAL_HOSTNAME"):
@@ -547,12 +656,38 @@ def handler_for(store):
                 self.send({"error": "Страница не найдена"}, 404)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception:
+                self.send({"error": "Сервис временно недоступен"}, 503)
 
         def do_POST(self):
             try:
                 if not self.allowed_host():
                     return self.send({"error": "Host не разрешён"}, 403)
                 route = self.route()
+                private = route.startswith("/api/workspace/")
+                store = live_store if private else demo_store
+                if route == "/api/integrations/wov":
+                    if not live_store or not access.configured:
+                        return self.send({"error": "Приём заявок ещё не подключён"}, 503)
+                    size = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < size <= 16000:
+                        return self.send({"error": "Неверный размер запроса"}, 413)
+                    # Fail closed before saving data. No mail reading endpoints are exposed.
+                    payload = json.loads(self.rfile.read(size))
+                    data = payload.get("form_data", {}) if isinstance(payload, dict) else {}
+                    if not isinstance(data, dict) or data.get("form_id") != "wov-v1" or data.get("site_url") != "https://rinpocheshka.github.io/wov/":
+                        raise ValueError("Источник не разрешён")
+                    minute = str(int(time.time() // 60))
+                    remote = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()[:100]
+                    ip_key = hashlib.sha256(remote.encode()).hexdigest()[:20]
+                    if not live_store.allow_quota("wov-minute:" + minute, 30) or not live_store.allow_quota("wov-ip:" + ip_key, 30) or not live_store.allow_quota("wov-day", 200):
+                        return self.send({"error": "Слишком много заявок. Попробуйте позже."}, 429)
+                    result = live_store.intake_wov(payload)
+                    return self.send({"accepted": True, "replayed": result["replayed"]}, 200 if result["replayed"] else 202)
+                if private:
+                    if not live_store or not access.configured or not access.authorized(self.headers.get("Authorization", "")):
+                        return self.send({"error": "Войдите в рабочий кабинет"}, 401)
+                    route = route.replace("/api/workspace/", "/api/", 1)
                 automation = route.startswith("/api/automation/")
                 if automation:
                     auth = self.headers.get("Authorization", "")
@@ -565,7 +700,7 @@ def handler_for(store):
                         return self.send({"error": "Источник запроса не разрешён"}, 403)
                     if not secrets.compare_digest(self.headers.get("X-Briefops-CSRF", ""), store.csrf):
                         return self.send({"error": "Обновите страницу перед действием"}, 403)
-                if os.getenv("BRIEFOPS_PUBLIC_DEMO") == "1" and not store.allow_quota("writes", int(os.getenv("BRIEFOPS_WRITE_DAILY_LIMIT", "300"))):
+                if not private and os.getenv("BRIEFOPS_PUBLIC_DEMO") == "1" and not store.allow_quota("writes", int(os.getenv("BRIEFOPS_WRITE_DAILY_LIMIT", "300"))):
                     return self.send({"error": "Дневной лимит действий демо достигнут. Попробуйте завтра."}, 429)
                 size = int(self.headers.get("Content-Length", "0"))
                 if not 0 < size <= 40000:
@@ -583,9 +718,13 @@ def handler_for(store):
                     return self.send({"lead": store.get_lead(lead_id)})
                 if route in {"/api/sweep", "/api/automation/sweep"}:
                     return self.send(store.sweep())
-                match = re.fullmatch(r"/api/leads/([a-f0-9]{12})/(retry|review|approve)", route)
+                match = re.fullmatch(r"/api/leads/([a-f0-9]{12})/(retry|review|approve|send-email)", route)
                 if match:
                     lead_id, action = match.groups()
+                    if action == "send-email":
+                        if not private:
+                            return self.send({"error": "Отправка доступна только в рабочем кабинете"}, 403)
+                        return self.send(store.queue_email(lead_id), 202)
                     if action == "retry":
                         store.retry(lead_id)
                         return self.send({"ok": True})
@@ -634,6 +773,19 @@ def main():
     local_llm_enabled = load_local_settings(ROOT)
     store = Store(args.db, use_llm=(args.llm or local_llm_enabled) and not args.rules, demo=not args.empty, token=token,
                   database_url=os.getenv("DATABASE_URL"), direct_url=os.getenv("DATABASE_URL_UNPOOLED"))
+    access = WorkspaceAccess()
+    live_store = None
+    if os.getenv("BRIEFOPS_LIVE_DATABASE_URL"):
+        if not access.configured:
+            raise RuntimeError("Neon Auth and BRIEFOPS_OWNER_EMAIL are required for the live workspace")
+        from psycopg.conninfo import conninfo_to_dict
+        demo_info = conninfo_to_dict(os.environ["DATABASE_URL"])
+        live_info = conninfo_to_dict(os.environ["BRIEFOPS_LIVE_DATABASE_URL"])
+        if demo_info.get("host", "").replace("-pooler", "") == live_info.get("host", "").replace("-pooler", "") and demo_info.get("dbname") == live_info.get("dbname"):
+            raise RuntimeError("Live workspace must use a separate database from the public demo")
+        live_store = Store(Path(args.db).parent / "live.sqlite3", use_llm=store.use_llm, demo=False, workspace=True,
+                           database_url=os.environ["BRIEFOPS_LIVE_DATABASE_URL"],
+                           direct_url=os.getenv("BRIEFOPS_LIVE_DATABASE_URL_UNPOOLED"), mailer=MailBridge())
     if not args.empty:
         llm_enabled = store.use_llm
         store.use_llm = False
@@ -646,15 +798,20 @@ def main():
         while not stopping.is_set():
             try:
                 store.process_one()
+                if live_store:
+                    live_store.process_one()
+                    live_store.deliver_one()
                 if time.time() - last_sweep > 15:
                     store.sweep()
+                    if live_store:
+                        live_store.sweep()
                     last_sweep = time.time()
             except Exception:
                 print("Worker: временный сбой; сохранённая очередь будет проверена снова.", flush=True)
             stopping.wait(0.35)
 
     threading.Thread(target=worker, daemon=True).start()
-    server = ThreadingHTTPServer((args.host, args.port), handler_for(store))
+    server = ThreadingHTTPServer((args.host, args.port), handler_for(store, live_store, access))
     print(f"BriefOps: http://127.0.0.1:{args.port}  |  Ctrl+C для остановки", flush=True)
     try:
         server.serve_forever()
@@ -665,6 +822,8 @@ def main():
         server.shutdown()
         server.server_close()
         store.database.close()
+        if live_store:
+            live_store.database.close()
 
 
 if __name__ == "__main__":

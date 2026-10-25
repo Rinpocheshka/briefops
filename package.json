@@ -1,14 +1,16 @@
 {
   "dependencies": {
     "@neon/config": "^1.9.4",
-    "@neon/env": "^1.6.5"
+    "@neon/env": "^1.6.5",
+    "@neondatabase/auth": "^0.7.0-beta"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
     "typescript": "^7.0.2"
   },
   "name": "briefops",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -16,5 +18,8 @@
     "test": "python -m unittest discover -s tests -v",
     "start": "python app.py --llm"
   },
-  "description": "Client inquiry processing, AI extraction and human-approved responses"
+  "description": "Client inquiry processing, AI extraction and human-approved responses",
+  "overrides": {
+    "zod": "4.6.7"
+  }
 }
