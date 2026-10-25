@@ -58,3 +58,18 @@
 - n8n по-прежнему не установлен: подготовлены экспорты и `N8N_SETUP.md`, запуск в движке не заявляется.
 
 - Браузер: новая AI Demo Studio прошла через NVIDIA за 1090 мс, получила услугу automation, бюджет 180 000 ₽ и верную несрочную категорию. История содержит имя модели; снимок artifacts/nvidia-demo.png. Старый процесс демо остановлен, обновлённый запущен на порту 8787.
+
+
+## Render + Neon — 25 октября 2026
+
+- `neon deploy`: No changes — branch production already matches the policy. Utilized services: Postgres. Pulled 3 Neon variables into .env.local.
+- `npm run build`: BUILD OK: Python syntax, workflow JSON and static assets validated; BUILD OK: JavaScript and Neon TypeScript configuration validated.
+- Регрессия Postgres: 20 tests, OK, на отдельной ветке dev-briefops. Параллельный приём, идемпотентность, повторы, retry/restart, SLA, ручная проверка, согласование, CSRF и токен API прошли.
+- При первом переносе выявлена и исправлена ошибка row_factory при SQL UPDATE без возвращаемых строк. После исправления полный прогон Postgres успешен.
+- Render build log: BUILD OK: Python syntax, workflow JSON and static assets validated. План сервиса подтверждён API: free, Singapore.
+- Облачный HTTP end-to-end: health storage=postgres; NVIDIA engine=llm, модель nemotron-3.5-lightning-30b-a3b, 1299 мс; бюджет 180000; исправление до 190000; approve; стадия response_ready; повторное approve идемпотентно. Неавторизованный API вернул 401, отсутствие CSRF/посторонний Origin — 403, конфликт ключа — 409. Отчёт: artifacts/cloud-smoke.json.
+- Выполнен Render restart. В новом процессе сохранились Cloud Demo Studio, бюджет 190000 и статус approved; подтверждено HTTP API и браузером.
+- В браузере https://briefops.onrender.com карточка показывает имя NVIDIA-модели, согласованный текст, бюджет и статус. Снимок artifacts/render-neon-demo.png.
+- n8n engine остаётся не установленным; выполнен реальный внешний API-контракт, но не сам workflow внутри движка n8n.
+
+- Финальный локальный прогон после поддержки публичных n8n exports: Ran 36 tests in 8.270s, OK. Финальный npm run build: обе проверки BUILD OK.

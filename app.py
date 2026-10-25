@@ -539,6 +539,10 @@ def handler_for(store):
                 files = {"/": ("static/index.html", "text/html; charset=utf-8"), "/app.js": ("static/app.js", "text/javascript; charset=utf-8"), "/styles.css": ("static/styles.css", "text/css; charset=utf-8"), "/workflow.json": ("workflows/intake.json", "application/json"), "/sla-workflow.json": ("workflows/sla.json", "application/json")}
                 if route in files:
                     name, mime = files[route]
+                    if route in {"/workflow.json", "/sla-workflow.json"} and os.getenv("RENDER_EXTERNAL_HOSTNAME"):
+                        workflow = (ROOT / name).read_text(encoding="utf-8")
+                        origin = "https://" + os.environ["RENDER_EXTERNAL_HOSTNAME"]
+                        return self.send(workflow.replace("http://127.0.0.1:8787", origin).encode(), content_type=mime)
                     return self.send((ROOT / name).read_bytes(), content_type=mime)
                 self.send({"error": "Страница не найдена"}, 404)
             except (BrokenPipeError, ConnectionResetError):

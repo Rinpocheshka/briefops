@@ -46,3 +46,8 @@ Invoke-RestMethod -Method Post -Uri 'ВСТАВЬТЕ_TEST_URL_ИЗ_N8N' -Conten
 JSON-схемы, связи блоков и HTTP-контракт проверены тестами проекта. Импорт и выполнение в самом n8n ещё не проверялись. Встроенная очередь BriefOps уже выполняет процесс без n8n.
 
 Официальные инструкции: [npm installation](https://docs.n8n.io/deploy/host-n8n/install-options/install-with-npm/), [Import/export](https://docs.n8n.io/workflows/export-import/), [Webhook](https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.webhook/).
+
+
+## Публичное демо Render
+
+Для подключения к облачному BriefOps скачайте экспорты с экрана «Автоматизация» на https://briefops.onrender.com: их HTTP-узлы уже содержат публичный адрес. Используйте отдельный cloud-токен интеграции, сохранённый владельцем локально в data/cloud-automation-token.txt. Локальный data/automation-token.txt относится к локальному серверу. Клиентский NVIDIA key не используется в n8n. Связь с публичным API проверена; запуск самого n8n ещё не выполнялся.

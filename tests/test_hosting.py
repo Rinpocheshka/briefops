@@ -35,6 +35,16 @@ class HostingHttpTests(HttpTests):
         headers["Origin"] = "https://evil.example"
         self.assertEqual(self.request("/api/intake", {"text": "Нужен сайт"}, headers)[0], 403)
 
+    @patch.dict("os.environ", {"RENDER_EXTERNAL_HOSTNAME": "demo.onrender.com"})
+    def test_cloud_workflow_download_has_public_api_and_no_credentials(self):
+        for path in ("/workflow.json", "/sla-workflow.json"):
+            status, workflow = self.request(path)
+            self.assertEqual(status, 200)
+            for node in workflow["nodes"]:
+                self.assertNotIn("credentials", node)
+                if node["type"] == "n8n-nodes-base.httpRequest":
+                    self.assertTrue(node["parameters"]["url"].startswith("https://demo.onrender.com/api/automation/"))
+
     @patch.dict("os.environ", {"BRIEFOPS_PUBLIC_DEMO": "1", "BRIEFOPS_WRITE_DAILY_LIMIT": "1"})
     def test_public_demo_has_persistent_write_cap(self):
         headers = {"X-Briefops-CSRF": self.store.csrf}
