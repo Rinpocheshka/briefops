@@ -1,0 +1,20 @@
+{
+  "name": "BriefOps · приём и обработка заявки",
+  "active": false,
+  "nodes": [
+    {"id":"briefops-inbound","name":"Входящая заявка","type":"n8n-nodes-base.webhook","typeVersion":2,"position":[0,0],"webhookId":"738263be-d9c8-4d65-a399-9c0dac950098","parameters":{"httpMethod":"POST","path":"briefops/lead","authentication":"headerAuth","responseMode":"responseNode","options":{}}},
+    {"id":"briefops-intake","name":"Надёжно сохранить заявку","type":"n8n-nodes-base.httpRequest","typeVersion":4.2,"position":[240,0],"retryOnFail":true,"maxTries":3,"waitBetweenTries":2000,"parameters":{"method":"POST","url":"http://127.0.0.1:8787/api/automation/intake","authentication":"genericCredentialType","genericAuthType":"httpHeaderAuth","sendBody":true,"specifyBody":"json","jsonBody":"={{ { text: $json.body.text, name: $json.body.name || '', company: $json.body.company || '', source: $json.body.source || 'n8n', message_id: $json.body.message_id || $json.headers['idempotency-key'] || $execution.id } }}","options":{"timeout":30000}}},
+    {"id":"briefops-process","name":"Разбор → повторы → CRM → черновик","type":"n8n-nodes-base.httpRequest","typeVersion":4.2,"position":[500,0],"retryOnFail":true,"maxTries":3,"waitBetweenTries":2000,"parameters":{"method":"POST","url":"http://127.0.0.1:8787/api/automation/process","authentication":"genericCredentialType","genericAuthType":"httpHeaderAuth","sendBody":true,"specifyBody":"json","jsonBody":"={{ { id: $json.lead.id } }}","options":{"timeout":30000}}},
+    {"id":"briefops-duplicate","name":"Это точный повтор?","type":"n8n-nodes-base.if","typeVersion":2.2,"position":[770,0],"parameters":{"conditions":{"options":{"caseSensitive":true,"leftValue":"","typeValidation":"strict","version":2},"conditions":[{"id":"match-duplicate","leftValue":"={{ $json.lead.status }}","rightValue":"duplicate","operator":{"type":"string","operation":"equals"}}],"combinator":"and"},"options":{}}},
+    {"id":"briefops-response-duplicate","name":"Подтвердить повтор","type":"n8n-nodes-base.respondToWebhook","typeVersion":1.4,"position":[1030,-100],"parameters":{"respondWith":"json","responseBody":"={{ { accepted: true, duplicate: true, lead_id: $json.lead.id, duplicate_of: $json.lead.duplicate_of } }}","options":{"responseCode":200}}},
+    {"id":"briefops-response","name":"Подтвердить обработку","type":"n8n-nodes-base.respondToWebhook","typeVersion":1.4,"position":[1030,120],"parameters":{"respondWith":"json","responseBody":"={{ { accepted: true, lead_id: $json.lead.id, status: $json.lead.status, needs_review: true } }}","options":{"responseCode":202}}},
+    {"id":"briefops-note","name":"Настройка и границы","type":"n8n-nodes-base.stickyNote","typeVersion":1,"position":[0,-340],"parameters":{"width":1250,"height":240,"content":"## BriefOps — входящие заявки для digital-студии\n1. Запустите Python-приложение из этого проекта.\n2. Создайте Header Auth credential: Authorization = Bearer <локальный токен>. Выберите его в Webhook и обоих HTTP Request.\n3. При другом хосте измените URL в HTTP-узлах.\n4. Передавайте стабильный message_id из источника; одинаковый ID с другим текстом вернёт 409.\n5. Разбор, CRM и черновик выполняются в транзакции Python-сервиса; очередь сохраняется в SQLite.\n6. Никакие сообщения клиенту не отправляются. Согласование — в интерфейсе BriefOps.\nWorkflow подготовлен для импорта. Версия n8n и credential проверяются при подключении вашей установки."}}
+  ],
+  "connections":{
+    "Входящая заявка":{"main":[[{"node":"Надёжно сохранить заявку","type":"main","index":0}]]},
+    "Надёжно сохранить заявку":{"main":[[{"node":"Разбор → повторы → CRM → черновик","type":"main","index":0}]]},
+    "Разбор → повторы → CRM → черновик":{"main":[[{"node":"Это точный повтор?","type":"main","index":0}]]},
+    "Это точный повтор?":{"main":[[{"node":"Подтвердить повтор","type":"main","index":0}],[{"node":"Подтвердить обработку","type":"main","index":0}]]}
+  },
+  "settings":{"executionOrder":"v1","timezone":"Asia/Saigon"},"pinData":{},"tags":[]
+}

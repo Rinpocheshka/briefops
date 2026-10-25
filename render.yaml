@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: briefops
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt && python tools/build.py
+    startCommand: python -u app.py --llm
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.14.0
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_URL_UNPOOLED
+        sync: false
+      - key: BRIEFOPS_LLM_PROVIDER
+        value: nvidia
+      - key: NVIDIA_MODEL
+        value: nvidia/nemotron-3.5-lightning-30b-a3b
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: BRIEFOPS_AUTOMATION_TOKEN
+        generateValue: true
+      - key: BRIEFOPS_PUBLIC_DEMO
+        value: "1"
+      - key: BRIEFOPS_LLM_DAILY_LIMIT
+        value: "50"
+      - key: BRIEFOPS_WRITE_DAILY_LIMIT
+        value: "300"

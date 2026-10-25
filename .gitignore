@@ -1,0 +1,15 @@
+data/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+.neon/
+.neon
+.venv/
+node_modules/
+dist/
+.agents/
+.claude/
+.codex/
+artifacts/

@@ -1,0 +1,11 @@
+{
+  "name":"BriefOps · контроль SLA каждые 5 минут",
+  "active":false,
+  "nodes":[
+    {"id":"briefops-schedule","name":"Каждые 5 минут","type":"n8n-nodes-base.scheduleTrigger","typeVersion":1.2,"position":[0,0],"parameters":{"rule":{"interval":[{"field":"minutes","minutesInterval":5}]}}},
+    {"id":"briefops-sla","name":"Создать задачи по просроченным заявкам","type":"n8n-nodes-base.httpRequest","typeVersion":4.2,"position":[280,0],"retryOnFail":true,"maxTries":3,"waitBetweenTries":2000,"parameters":{"method":"POST","url":"http://127.0.0.1:8787/api/automation/sweep","authentication":"genericCredentialType","genericAuthType":"httpHeaderAuth","sendBody":true,"specifyBody":"json","jsonBody":"{}","options":{"timeout":15000}}},
+    {"id":"briefops-sla-note","name":"Без повторных уведомлений","type":"n8n-nodes-base.stickyNote","typeVersion":1,"position":[0,-260],"parameters":{"width":650,"height":190,"content":"## SLA — 20 минут до согласованного первого ответа\nВыберите Header Auth credential: Authorization = Bearer <локальный токен>.\nДля каждой просроченной заявки создаётся одна задача и одна запись в журнале. Повторные проверки не дублируют их.\nВстроенный worker также проверяет SLA каждые 15 секунд; этот workflow показывает внешний запуск по расписанию.\nНастройте URL и опубликуйте workflow в своей установке n8n. Внешняя отправка уведомлений не настроена."}}
+  ],
+  "connections":{"Каждые 5 минут":{"main":[[{"node":"Создать задачи по просроченным заявкам","type":"main","index":0}]]}},
+  "settings":{"executionOrder":"v1","timezone":"Asia/Saigon"},"pinData":{},"tags":[]
+}

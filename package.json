@@ -1,0 +1,19 @@
+{
+  "dependencies": {
+    "@neon/config": "^1.9.4",
+    "@neon/env": "^1.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  },
+  "name": "briefops",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && node tools/build.mjs",
+    "test": "python -m unittest discover -s tests -v",
+    "start": "python app.py --llm"
+  }
+}
