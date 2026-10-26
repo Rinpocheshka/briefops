@@ -10,15 +10,16 @@ const ready=active?(async()=>{
   client=createAuthClient(config.base_url,{adapter:BetterAuthVanillaAdapter({fetchOptions:{credentials:'include'}})});
 })():Promise.resolve();
 
-async function token(){
+async function token(force=false){
+  if(force){cachedToken="";tokenUntil=0;}
   await ready;
   if(cachedToken&&Date.now()<tokenUntil)return cachedToken;
   const {data,error}=await client.token();
-  if(error||!data?.token){location.replace('/login');throw new Error('Войдите в рабочий кабинет');}
+  if(error||!data?.token){if(location.pathname==='/workspace')location.replace('/login');throw new Error('Сессия недоступна. Войдите в рабочий кабинет ещё раз.');}
   cachedToken=data.token;tokenUntil=Date.now()+5*60*1000;
   return cachedToken;
 }
-window.briefopsAuth={ready,token,async signOut(){await ready;await client.signOut();cachedToken='';location.replace('/login');}};
+window.briefopsAuth={ready,token,async signOut(){await ready;const result=await client.signOut();if(result.error)throw new Error('Не удалось завершить сеанс. Попробуйте ещё раз.');cachedToken='';location.replace('/login');}};
 // A rejected configuration must not create an unhandled promise on the public demo.
 ready.catch(()=>{});
 
@@ -27,18 +28,29 @@ if(location.pathname==='/login'){
   const message=document.getElementById('loginMessage');
   const code=document.getElementById('otpGroup');
   const button=document.getElementById('loginSubmit');
-  let sent=false, email='';
+  const resend=document.getElementById('resendCode');
+  let sent=false, email='',resendAt=0;
+  async function sendCode(){
+    const result=await client.emailOtp.sendVerificationOtp({email,type:'sign-in'});
+    if(result.error)throw new Error('Не удалось отправить код. Проверьте адрес и попробуйте позже.');
+    resendAt=Date.now()+60000;resend.hidden=false;resend.disabled=true;
+    setTimeout(()=>{resend.disabled=false;},60000);
+  }
+  resend.addEventListener('click',async()=>{
+    if(Date.now()<resendAt)return;resend.disabled=true;
+    try{await sendCode();message.textContent='Новый код отправлен. Введите его в поле «Код из письма» ниже.';form.elements.otp.value='';form.elements.otp.focus();}
+    catch(error){message.textContent=error.message;resend.disabled=false;}
+  });
   form.addEventListener('submit',async event=>{
     event.preventDefault();button.disabled=true;message.textContent='';
     try{
       await ready;
       if(!sent){
         email=form.elements.email.value.trim().toLowerCase();
-        const result=await client.emailOtp.sendVerificationOtp({email,type:'sign-in'});
-        if(result.error)throw new Error('Не удалось отправить код. Проверьте адрес и попробуйте позже.');
+        await sendCode();
         sent=true;code.hidden=false;form.elements.email.readOnly=true;
         form.elements.otp.required=true;button.textContent='Войти';
-        message.textContent='Код отправлен на вашу почту. Введите его ниже.';
+        message.textContent='Код отправлен на вашу почту. Введите его в поле «Код из письма» ниже и нажмите «Войти».';
         form.elements.otp.focus();
       }else{
         const result=await client.signIn.emailOtp({email,otp:form.elements.otp.value.trim()});
@@ -52,7 +64,7 @@ if(location.pathname==='/login'){
     finally{button.disabled=false;}
   });
   document.getElementById('changeEmail').addEventListener('click',()=>{
-    sent=false;code.hidden=true;form.elements.email.readOnly=false;form.elements.otp.required=false;
+    sent=false;code.hidden=true;resend.hidden=true;form.elements.email.readOnly=false;form.elements.otp.required=false;
     form.elements.otp.value='';button.textContent='Получить код';message.textContent='';
   });
 }

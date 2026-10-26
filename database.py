@@ -1,6 +1,7 @@
 """Storage boundary: local SQLite or TLS Postgres on Neon."""
 import re
 import sqlite3
+import certifi
 from contextlib import contextmanager
 
 
@@ -47,7 +48,7 @@ class Database:
             # Neon PgBouncer handles server pooling; keep the client pool small.
             self.pool = ConnectionPool(database_url, min_size=0, max_size=4, timeout=20,
                                        kwargs={"row_factory": row_factory, "prepare_threshold": None,
-                                               "connect_timeout": 15, "sslmode": "require"})
+                                               "connect_timeout": 15, "sslmode": "verify-full", "sslrootcert": certifi.where()})
 
     @contextmanager
     def connect(self):
@@ -78,9 +79,15 @@ class Database:
         direct_url = direct_url or self.pool.conninfo
         if "-pooler" in conninfo_to_dict(direct_url).get("host", ""):
             raise ValueError("DATABASE_URL_UNPOOLED is required for migrations")
-        with psycopg.connect(direct_url, connect_timeout=20, sslmode="require") as connection:
+        with psycopg.connect(direct_url, connect_timeout=20, sslmode="verify-full", sslrootcert=certifi.where()) as connection:
             connection.execute("SELECT pg_advisory_xact_lock(708184053)")
             PostgresConnection(connection).executescript(script)
+
+    @contextmanager
+    def read(self):
+        with self.connect() as connection:
+            connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY" if self.pool else "BEGIN")
+            yield connection
 
     def close(self):
         if self.pool:

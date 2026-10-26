@@ -48,6 +48,8 @@ class LiveIntegrationTests(unittest.TestCase):
 
     def request(self, path, data=None, owner=False, csrf=True):
         headers={"Content-Type":"application/json"}
+        if path == "/api/integrations/wov":
+            headers["Origin"]="https://rinpocheshka.github.io"
         if owner:
             headers["Authorization"]="Bearer owner-token"
         if csrf:
@@ -165,11 +167,11 @@ class AccessTests(unittest.TestCase):
         with patch.dict(os.environ,{"NEON_AUTH_BASE_URL":"https://auth.example/neondb/auth","BRIEFOPS_OWNER_EMAIL":"owner@example.com"}):
             access=WorkspaceAccess()
         access.client=Mock()
-        access.client.get_signing_key_from_jwt.return_value=Mock(key=private.public_key())
+        access.client.get_signing_keys.return_value=[Mock(key=private.public_key(), key_id="test-key")]
         good={"email":"owner@example.com","emailVerified":True,"sub":"owner-id", "iat":int(time.time()),
               "exp":int(time.time())+300,"iss":"https://auth.example","aud":"https://auth.example"}
         def permitted(claims):
-            return access.authorized("Bearer "+jwt.encode(claims,private,algorithm="EdDSA"))
+            return access.authorized("Bearer "+jwt.encode(claims,private,algorithm="EdDSA",headers={"kid":"test-key"}))
         self.assertTrue(permitted(good))
         for change in ({"email":"stranger@example.com"},{"emailVerified":False},{"emailVerified":None},
                        {"banned":True},{"exp":1},{"iss":"https://other.example"},{"aud":"https://other.example"}):
